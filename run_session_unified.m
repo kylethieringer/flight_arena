@@ -52,7 +52,10 @@ function out = run_session_unified(overrides)
 %   <base>.mat             Data (14 x N), variables, allRandomizedStimOrders,
 %                          stimTable, params, phantom, baslerInfo
 %   <base>_plot.svg/.png   summary figure
-%   <base>_TopCamera.mp4, <base>_SideCamera.mp4
+%   <base>_TopCamera.avi, <base>_SideCamera.avi   (Motion JPEG AVI, streamed to
+%                          disk during acquisition; see basler.video_profile.
+%                          Only 180 deg rotation is baked in, on-camera -- check
+%                          baslerInfo.<cam>.rotate_deg_pending before tracking)
 %   Phantom sequence: <phantom.saveRoot>\<experiment_name>\<base>_PhantomCamera
 %
 % Author: Yichen Luo, 2026-09 (unified version)
@@ -134,10 +137,18 @@ basler.Exposure_time           = 9000;  % us; clamped to 90 % of the frame perio
 basler.trigger_ctr             = 'ctr0';
 basler.trigger_initial_delay_s = 0.05;
 basler.format                  = 'Mono8';
-basler.video_profile           = 'MPEG-4';
-basler.video_quality           = 100;
+% Frames stream to disk during acquisition (LoggingMode = 'disk' + DiskLogger), so
+% nothing is buffered in RAM and there is no post-experiment encode. Motion JPEG AVI
+% is fixed by docs/superpowers/specs/2026-07-27-video-save-streaming-design.md: fast
+% per-frame encode, no inter-frame compression, read natively by DeepLabCut / SLEAP.
+basler.video_profile           = 'Motion JPEG AVI';
+basler.video_quality           = 90;
 basler.discover_timeout_s      = 5;     % wait up to this long for the cameras to enumerate after imaqreset
-% rotate_deg: clockwise rotation applied to the saved video (0, 90, 180 or 270)
+basler.disk_flush_timeout_s    = 30;    % wait up to this long for the disk logger to drain after stop
+% rotate_deg: clockwise rotation the video should end up with (0, 90, 180 or 270).
+% Disk logging writes frames straight from the camera, so only 180 deg can actually be
+% baked in (on-camera ReverseX + ReverseY). 90/270 have no GenICam equivalent and are
+% recorded as baslerInfo.<cam>.rotate_deg_pending for analysis to apply.
 basler.top  = struct('enable', true,  'label', 'TopCamera',  'serial', '22703705', ...
                      'gain', 5,  'gamma', 0.5, 'binning', 2, ...
                      'rotate_deg', 90,  'exposure_active_out', false, 'line_inverter', 'False');
@@ -275,8 +286,15 @@ files = struct();
 files.mat        = fullfile(saveFolder, [baseFileName '.mat']);
 files.plot_svg   = fullfile(saveFolder, [baseFileName '_plot.svg']);
 files.plot_png   = fullfile(saveFolder, [baseFileName '_plot.png']);
-files.top_video  = fullfile(saveFolder, [baseFileName '_' basler.top.label '.mp4']);
-files.side_video = fullfile(saveFolder, [baseFileName '_' basler.side.label '.mp4']);
+switch lower(basler.video_profile)                      % container matched to the codec
+    case 'mpeg-4',                              vidExt = '.mp4';
+    case {'motion jpeg avi', 'grayscale avi', 'uncompressed avi'}, vidExt = '.avi';
+    case {'archival', 'motion jpeg 2000'},      vidExt = '.mj2';
+    otherwise,                                  vidExt = '.avi';
+end
+basler.video_ext = vidExt;
+files.top_video  = fullfile(saveFolder, [baseFileName '_' basler.top.label vidExt]);
+files.side_video = fullfile(saveFolder, [baseFileName '_' basler.side.label vidExt]);
 if strcmpi(phantom.save_format, 'cine')
     files.phantom = fullfile(phantom.saveFolder, [baseFileName '_PhantomCamera.cine']);
 else
@@ -415,8 +433,8 @@ if anyCam
                'close Pylon Viewer / other GenTL clients, or set basler.<camera>.enable = false.'], ...
               strjoin(missing, ', '), basler.discover_timeout_s);
     end
-    if basler.top.enable,  [vids.top,  srcs.top]  = setupBasler(basler.top,  camInfo); end
-    if basler.side.enable, [vids.side, srcs.side] = setupBasler(basler.side, camInfo); end
+    if basler.top.enable,  [vids.top,  srcs.top]  = setupBasler('top',  camInfo, files.top_video);  end
+    if basler.side.enable, [vids.side, srcs.side] = setupBasler('side', camInfo, files.side_video); end
 end
 
 %% ---------------- Phantom connect / configure ---------------------------
@@ -529,6 +547,7 @@ for block = 1:acq.blocks
     end
 
     if aoCol.phantom > 0, aoData = [ledSignal, phantomSignal]; else, aoData = ledSignal; end
+    aoData(end, :) = 0;   % never leave the LED / Phantom trigger latched when the block ends
     if ~hw.simulate
         queueOutputData(mainSession, aoData);
         mainSession.NotifyWhenDataAvailableExceeds = round(fs * acq.notify_period_s);
@@ -631,13 +650,11 @@ if ~isempty(vids.side), stop(vids.side); end
 arenaRest();
 if ~isempty(lh), delete(lh); lh = []; end
 
-%% ---------------- write Basler videos ----------------------------------
-if ~isempty(vids.top),  baslerInfo.top  = writeCameraVideo(vids.top,  srcs.top,  basler.top,  files.top_video);  end
-if ~isempty(vids.side), baslerInfo.side = writeCameraVideo(vids.side, srcs.side, basler.side, files.side_video); end
-if ~isempty(vids.top),  delete(vids.top);  vids.top  = []; end
-if ~isempty(vids.side), delete(vids.side); vids.side = []; end
-
-%% ---------------- assemble and save -------------------------------------
+%% ---------------- assemble and save (BEFORE the videos) -----------------
+% The DAQ data is the irreplaceable part of a session, so it goes to disk before
+% anything touches the cameras: an out-of-memory getdata, a full disk or a codec
+% failure in writeCameraVideo must not be able to take the whole run with it.
+% baslerInfo is saved as a placeholder here and appended for real further down.
 Data = Data(:, 1:wp);
 
 params = struct();
@@ -683,6 +700,36 @@ totalBytes = numel(Data) * 8;
 if totalBytes > 1.8e9, saveArgs{end + 1} = '-v7.3'; end
 save(files.mat, saveArgs{:});
 fprintf('Saved.\n');
+
+%% ---------------- write Basler videos ----------------------------------
+% Each camera is isolated: one failing must not stop the other, the baslerInfo
+% append, or the summary plot. The DAQ data is already on disk at this point.
+if ~isempty(vids.top)
+    try
+        baslerInfo.top = writeCameraVideo(vids.top, srcs.top, basler.top, files.top_video);
+    catch ME
+        warning('run_session_unified:videoWrite', '%s: video write failed: %s', basler.top.label, ME.message);
+    end
+end
+if ~isempty(vids.side)
+    try
+        baslerInfo.side = writeCameraVideo(vids.side, srcs.side, basler.side, files.side_video);
+    catch ME
+        warning('run_session_unified:videoWrite', '%s: video write failed: %s', basler.side.label, ME.message);
+    end
+end
+if ~isempty(vids.top),  delete(vids.top);  vids.top  = []; end
+if ~isempty(vids.side), delete(vids.side); vids.side = []; end
+
+if anyCam
+    try
+        save(files.mat, 'baslerInfo', '-append');   % replaces the placeholder saved above
+        fprintf('baslerInfo appended to %s\n', files.mat);
+    catch ME
+        warning('run_session_unified:baslerInfoAppend', ...
+                'Could not append baslerInfo to %s: %s', files.mat, ME.message);
+    end
+end
 
 %% ---------------- final plot -------------------------------------------
 if plotting.enable
@@ -975,14 +1022,15 @@ fprintf('\nAll done (%.1f s).\n', experimentElapsed_s);
         arenaCmd('start');
     end
 
-    function [vid, src] = setupBasler(cfg, camInfo)
+    function [vid, src] = setupBasler(camKey, camInfo, videoFile)
+        cfg   = basler.(camKey);
         names = {camInfo.DeviceInfo.DeviceName};
         idx = find(contains(names, ['(' cfg.serial ')']), 1);
         assert(~isempty(idx), '%s: serial %s not found among GenTL devices.', cfg.label, cfg.serial);
         fprintf('%s -> %s (DeviceID %d)\n', cfg.label, names{idx}, camInfo.DeviceInfo(idx).DeviceID);
         vid = videoinput('gentl', camInfo.DeviceInfo(idx).DeviceID, basler.format);
         triggerconfig(vid, 'hardware');
-        vid.LoggingMode      = 'memory';
+        vid.LoggingMode      = 'disk';   % frames encode to disk as they arrive; nothing buffers in RAM
         vid.FramesPerTrigger = inf;
         src = getselectedsource(vid);
         if cfg.exposure_active_out                 % Line3 = ExposureActive, active high (read back on AI11)
@@ -1008,47 +1056,82 @@ fprintf('\nAll done (%.1f s).\n', experimentElapsed_s);
         src.ExposureTime = basler.Exposure_time;
         src.Gain         = cfg.gain;
         src.Gamma        = cfg.gamma;
+
+        % Rotation must be baked in on-camera: with disk logging the frame goes
+        % straight from the sensor to the encoder, so MATLAB never sees it. Only
+        % 180 deg is expressible in GenICam (ReverseX + ReverseY); 90/270 are left
+        % for analysis and recorded in baslerInfo.<cam>.rotate_deg_pending.
+        basler.(camKey).rotation_applied   = 'none';
+        basler.(camKey).rotate_deg_pending = cfg.rotate_deg;
+        if cfg.rotate_deg == 180
+            try
+                src.ReverseX = 'True';
+                src.ReverseY = 'True';
+                basler.(camKey).rotation_applied   = 'camera_reverse_xy';
+                basler.(camKey).rotate_deg_pending = 0;
+                fprintf('  180 deg baked in on-camera (ReverseX + ReverseY)\n');
+            catch ME
+                warning('run_session_unified:cameraRotate', ...
+                        '%s: could not set ReverseX/ReverseY (%s). Video is unrotated; analysis must apply %d deg.', ...
+                        cfg.label, ME.message, cfg.rotate_deg);
+            end
+        elseif cfg.rotate_deg ~= 0
+            fprintf('  %d deg NOT applied (no GenICam equivalent); analysis must rotate. See baslerInfo.%s.rotate_deg_pending\n', ...
+                    cfg.rotate_deg, camKey);
+        end
+
+        % The DiskLogger must exist before start(); the engine opens and closes it.
+        vw = VideoWriter(videoFile, basler.video_profile);
+        vw.FrameRate = basler.fps;
+        if isprop(vw, 'Quality'), vw.Quality = basler.video_quality; end
+        vid.DiskLogger = vw;
+
         src.TriggerMode  = 'On';
         fprintf('  trigger %s on %s, exposure %g us, gain %.3f, gamma %.2f, binning %d\n', ...
                 src.TriggerMode, src.TriggerSource, src.ExposureTime, src.Gain, src.Gamma, cfg.binning);
+        fprintf('  streaming to %s (%s, quality %g)\n', videoFile, basler.video_profile, basler.video_quality);
     end
 
     function info = writeCameraVideo(vid, src, cfg, filename)
-        info = struct('label', cfg.label, 'file', filename, 'frames', 0, 'expected_frames', ...
-                      acq.blocks * acq.TrialLength * basler.fps, 'rotate_deg', cfg.rotate_deg);
+        % Disk logging did the encoding during the run; only the last buffered
+        % frames can still be in flight. Wait for the logger to drain, then report.
+        info = struct('label', cfg.label, 'file', filename, 'frames', 0, ...
+                      'frames_acquired', 0, 'dropped_frames', 0, 'expected_frames', ...
+                      acq.blocks * acq.TrialLength * basler.fps, ...
+                      'rotate_deg', cfg.rotate_deg, ...
+                      'rotation_applied', cfg.rotation_applied, ...
+                      'rotate_deg_pending', cfg.rotate_deg_pending, ...
+                      'video_profile', basler.video_profile, 'video_quality', basler.video_quality);
         try
             info.source_settings = get(src);
         catch
             info.source_settings = [];
         end
-        n = vid.FramesAvailable;
-        fprintf('%s: %d frames available (expected ~%d)\n', cfg.label, n, info.expected_frames);
-        if n == 0
-            warning('%s: no frames captured; no video written.', cfg.label);
-            return;
+        t0 = tic;
+        while vid.FramesAcquired ~= vid.DiskLoggerFrameCount
+            if toc(t0) > basler.disk_flush_timeout_s
+                warning('run_session_unified:diskFlush', ...
+                        '%s: disk logger still %d frame(s) behind after %g s; closing the file anyway.', ...
+                        cfg.label, vid.FramesAcquired - vid.DiskLoggerFrameCount, basler.disk_flush_timeout_s);
+                break;
+            end
+            pause(0.05);
         end
-        [frames, ts, md] = getdata(vid, n);
-        info.frames = size(frames, 4);
-        info.frame_time_s = ts;
-        try
-            info.first_frame_abs_time = md(1).AbsTime;
-            info.last_frame_abs_time  = md(end).AbsTime;
-        catch
+        info.frames_acquired = vid.FramesAcquired;
+        info.frames          = vid.DiskLoggerFrameCount;
+        info.dropped_frames  = info.frames_acquired - info.frames;
+        info.flush_wait_s    = toc(t0);
+        fprintf('%s: %d frames written to %s (acquired %d, expected ~%d, flush %.2f s)\n', ...
+                cfg.label, info.frames, filename, info.frames_acquired, info.expected_frames, info.flush_wait_s);
+        if info.frames == 0
+            warning('%s: no frames written to %s.', cfg.label, filename);
+        elseif info.dropped_frames > 0
+            warning('run_session_unified:droppedFrames', '%s: %d frame(s) acquired but never written.', ...
+                    cfg.label, info.dropped_frames);
         end
-        switch cfg.rotate_deg                                   % clockwise, all frames at once
-            case 90,  frames = flip(permute(frames, [2 1 3 4]), 2);
-            case 180, frames = flip(flip(frames, 1), 2);        % upside down + mirrored
-            case 270, frames = flip(permute(frames, [2 1 3 4]), 1);
+        if info.rotate_deg_pending ~= 0
+            fprintf('%s: video is UNROTATED; analysis must apply %d deg clockwise.\n', cfg.label, info.rotate_deg_pending);
         end
-        if cfg.rotate_deg ~= 0, fprintf('%s: rotated %d deg clockwise\n', cfg.label, cfg.rotate_deg); end
-        vw = VideoWriter(filename, basler.video_profile);
-        vw.FrameRate = basler.fps;
-        if isprop(vw, 'Quality'), vw.Quality = basler.video_quality; end
-        open(vw);
-        writeVideo(vw, frames);
-        close(vw);
-        info.frame_size = size(frames);
-        fprintf('%s: video written to %s\n', cfg.label, filename);
     end
 
     function phantomStartCapture()
@@ -1125,6 +1208,46 @@ fprintf('\nAll done (%.1f s).\n', experimentElapsed_s);
         end
     end
 
+    function zeroAnalogOutputs()
+        % Drive every analog output back to 0 V. NI-DAQmx holds the last written
+        % sample when a task is stopped or released, so aborting mid-stimulus would
+        % otherwise leave the LED driver latched at opto.amplitude_V until MATLAB
+        % restarts. Fast path: an on-demand scan on mainSession. If that is rejected
+        % (the session also owns the ctr0 PulseGeneration channel), release it and
+        % take the channels with a short-lived AO-only session instead.
+        if hw.simulate || isempty(deviceID), return; end
+        aoNames = {opto.ao};
+        if aoCol.phantom > 0, aoNames{end + 1} = phantom.trigAO; end
+        z = zeros(1, numel(aoNames));
+        try
+            outputSingleScan(mainSession, z);
+            fprintf('Analog outputs (%s) returned to 0 V.\n', strjoin(aoNames, ', '));
+            return;
+        catch
+        end
+        s = [];
+        try
+            try
+                if ~isempty(mainSession), release(mainSession); end
+            catch
+            end
+            s = daq.createSession('ni');
+            for k = 1:numel(aoNames)
+                addAnalogOutputChannel(s, deviceID, aoNames{k}, 'Voltage');
+            end
+            outputSingleScan(s, z);
+            fprintf('Analog outputs (%s) returned to 0 V.\n', strjoin(aoNames, ', '));
+        catch ME
+            warning('run_session_unified:aoZero', ...
+                    'Could not return %s to 0 V: %s. CHECK THE LED DRIVER MANUALLY.', ...
+                    strjoin(aoNames, ', '), ME.message);
+        end
+        try
+            if ~isempty(s), release(s); end
+        catch
+        end
+    end
+
     function cleanupAll()
         % Idempotent teardown: safe to call after a normal run, an error, or Ctrl+C.
         try
@@ -1132,7 +1255,12 @@ fprintf('\nAll done (%.1f s).\n', experimentElapsed_s);
         catch
         end
         try
-            if ~isempty(mainSession), stop(mainSession); release(mainSession); end
+            if ~isempty(mainSession), stop(mainSession); end
+        catch
+        end
+        zeroAnalogOutputs();          % before release: the fast path needs a live session
+        try
+            if ~isempty(mainSession), release(mainSession); end
         catch
         end
         for camKey = {'top', 'side'}
