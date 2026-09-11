@@ -12,6 +12,9 @@ function out = run_session_unified(overrides)
 %   run_session_unified(ov)             % ov = struct of overrides, e.g.
 %                                       %   ov.opto.mode = 'randomized';
 %                                       %   ov.basler.side.enable = false;
+%                                       % Every override field must already exist in
+%                                       % USER SETTINGS: an unknown or misspelled one
+%                                       % is an error, not a silently ignored default.
 %   out = run_session_unified(...)      % returns Data, params and results (in ans if not captured)
 %
 % MODES (all selected in the USER SETTINGS block)
@@ -217,6 +220,14 @@ N_block = round(acq.TrialLength * fs);
 N_total = N_block * acq.blocks;
 nAI     = numel(acq.ai_channels);
 assert(numel(acq.ai_names) == nAI, 'acq.ai_names must have one entry per AI channel.');
+% Data row 1 holds block-relative time in single precision. Single's spacing grows
+% with magnitude, so a long enough block would make consecutive timestamps collide.
+assert(eps(single(acq.TrialLength)) < 1 / fs, ...
+    ['acq.TrialLength = %g s at %g Hz cannot be time-stamped in single precision: ' ...
+     'the spacing at %g s is %g s, coarser than the %g s sample period. Shorten ' ...
+     'TrialLength (max ~%.0f s at this rate) or store Data as double.'], ...
+    acq.TrialLength, fs, acq.TrialLength, eps(single(acq.TrialLength)), 1 / fs, ...
+    double(acq.TrialLength) * (1 / fs) / double(eps(single(acq.TrialLength))));
 chVals = cellfun(@(f) plotting.ch.(f), fieldnames(plotting.ch));
 assert(all(chVals >= 1 & chVals <= nAI), 'plotting.ch entries must index into acq.ai_channels (1..%d).', nAI);
 
@@ -232,15 +243,42 @@ end
 % Opto pulse geometry
 opto.mode = lower(opto.mode);
 assert(any(strcmp(opto.mode, {'randomized', 'windows', 'both', 'none'})), 'opto.mode must be randomized | windows | both | none');
-opto.period_samples = max(1, round(fs / opto.Frequency));
-opto.on_samples     = round(fs * opto.PulseDuration / 1000);
-if opto.on_samples >= opto.period_samples
-    opto.on_samples = opto.period_samples;
-    if ~strcmp(opto.mode, 'none')
-        warning('PulseDuration >= 1/Frequency: LED will be continuous during stimuli.');
+% Carrier geometry. duty_cycle is exact rather than quantised to whole samples:
+% the shared pulseTrain kernel uses a modular phase, so the realised pulse rate
+% matches opto.Frequency even when the period is not a whole number of samples.
+% period_samples / on_samples are kept for the saved metadata only and may now be
+% fractional -- nothing builds the waveform from them any more.
+opto.duty_cycle     = min(1, opto.PulseDuration / 1000 * opto.Frequency);
+opto.period_samples = fs / opto.Frequency;
+opto.on_samples     = opto.duty_cycle * opto.period_samples;
+if opto.PulseDuration / 1000 * opto.Frequency >= 1 && ~strcmp(opto.mode, 'none')
+    warning('PulseDuration >= 1/Frequency: LED will be continuous during stimuli.');
+end
+if ~strcmp(opto.mode, 'none')
+    % Build one sample purely to run the kernel's checks here, at setup, rather
+    % than discovering an impossible carrier once the fly is already on the rig.
+    % Catches a sub-sample PulseDuration (which used to yield a silently all-zero
+    % LED command) and a Frequency above Nyquist.
+    pulseTrain(1, opto.amplitude_V, fs, opto.Frequency, opto.duty_cycle);
+end
+% Randomized stimuli are laid down at TrialLength/(n+1), so a duration longer than
+% that spacing gets its tail overwritten by the next stimulus -- silently, while
+% stimTable still claims the full duration. Note that "fits between its neighbours"
+% and "fits inside the block" are the same condition: the last onset is spacing*n
+% and the block ends at spacing*(n+1), so both reduce to duration <= spacing.
+if any(strcmp(opto.mode, {'randomized', 'both'})) && ~isempty(opto.stimDurations)
+    nStims  = numel(opto.stimDurations);
+    spacing = acq.TrialLength / (nStims + 1);
+    longest = max(opto.stimDurations) / 1000;
+    if longest > spacing
+        error('run_session_unified:optoOverlap', ...
+              ['%d stimuli in a %g s block are spaced %g s apart, but the longest entry in ' ...
+               'opto.stimDurations is %g s -- they would overwrite each other and the last ' ...
+               'would run past the end of the block. Lengthen acq.TrialLength to >= %g s, ' ...
+               'shorten the stimulus, or use fewer.'], ...
+              nStims, acq.TrialLength, spacing, longest, longest * (nStims + 1));
     end
 end
-opto.duty_cycle = opto.on_samples / opto.period_samples;
 if any(strcmp(opto.mode, {'windows', 'both'})) && ~isempty(opto.windows_s)
     W = opto.windows_s;
     assert(size(W, 2) == 2 && all(W(:, 1) >= 0) && all(W(:, 2) <= acq.TrialLength) && all(W(:, 2) > W(:, 1)), ...
@@ -267,16 +305,38 @@ if phantom.enable && ~isempty(phantom.gate_ai)
     assert(~isempty(phantom.gate_col), 'phantom.gate_ai "%s" is not in acq.ai_names.', phantom.gate_ai);
 end
 
-% File names
+% File names. The trial glob and the file name must come from the same drop-empties
+% logic: interpolating metadata straight into a glob put a double underscore in it
+% whenever a field was empty ('*_test__Fly1_Trial*'), so it never matched a real
+% file and every run came out as Trial1. Appending a literal 'Trial*' token to the
+% parts list makes that impossible -- it degrades to '*_Trial*.mat' at worst.
 if ~exist(saveFolder, 'dir'), mkdir(saveFolder); end
+trialGlobParts = {meta.experiment_name, meta.genotype, prefixIfNonEmpty('Fly', meta.flyNumber), 'Trial*'};
+trialGlobParts = trialGlobParts(~cellfun(@isempty, trialGlobParts));
+trialGlob  = ['*_' strjoin(trialGlobParts, '_') '.mat'];
+existing   = dir(fullfile(saveFolder, trialGlob));
+usedTrials = [];
+for iFile = 1:numel(existing)
+    tok = regexp(existing(iFile).name, '_Trial(\d+)(?:_|\.)', 'tokens', 'once');
+    if ~isempty(tok), usedTrials(end + 1) = str2double(tok{1}); end %#ok<AGROW>
+end
 if meta.auto_trial_number
-    pat = fullfile(saveFolder, sprintf('*_%s_%s_Fly%s_Trial*.mat', meta.experiment_name, meta.genotype, meta.flyNumber));
-    meta.trialNum = num2str(numel(dir(pat)) + 1);
-    fprintf('Auto trial number: %s\n', meta.trialNum);
+    % max + 1, not count + 1: a deleted or renamed trial must not make the next run
+    % reuse a number that is still on disk.
+    if isempty(usedTrials), meta.trialNum = '1';
+    else,                   meta.trialNum = num2str(max(usedTrials) + 1);
+    end
+    fprintf('Auto trial number: %s (%d file(s) matched %s)\n', meta.trialNum, numel(existing), trialGlob);
+elseif ismember(str2double(asText(meta.trialNum)), usedTrials)
+    warning('run_session_unified:trialReused', ...
+            ['Trial %s already exists for this fly in %s (%d file(s) matched %s). The new file is ' ...
+             'time-stamped so nothing is overwritten, but two files will claim the same trial number.'], ...
+            asText(meta.trialNum), saveFolder, numel(existing), trialGlob);
 end
 parts = {meta.experiment_name, meta.genotype, prefixIfNonEmpty('Fly', meta.flyNumber), ...
          prefixIfNonEmpty('Trial', meta.trialNum), meta.stimulus_regime, meta.stimulus_position, ...
          meta.phantom_position, meta.visual_stim_type, meta.carbon_dioxide};
+parts = cellfun(@asText, parts, 'UniformOutput', false);   % overrides may pass numbers
 parts = parts(~cellfun(@isempty, parts));
 FlyType      = strjoin(parts, '_');
 savedate     = datestr(scriptStart, 'yyyy_mmdd_HHMMSS');
@@ -284,6 +344,13 @@ baseFileName = [savedate '_' FlyType];
 
 files = struct();
 files.mat        = fullfile(saveFolder, [baseFileName '.mat']);
+% Backstop against clobbering earlier data. baseFileName starts with a
+% second-resolution timestamp, so this only fires if two runs start within the same
+% second -- the duplicate-trial-number case is caught by the warning above instead.
+if exist(files.mat, 'file')
+    error('run_session_unified:fileExists', ...
+          '%s already exists; refusing to overwrite it.', files.mat);
+end
 files.plot_svg   = fullfile(saveFolder, [baseFileName '_plot.svg']);
 files.plot_png   = fullfile(saveFolder, [baseFileName '_plot.png']);
 switch lower(basler.video_profile)                      % container matched to the codec
@@ -314,13 +381,20 @@ fprintf('Phantom    : enable %d, %s, window [%g %g] s, trigger at %g s on %s, Re
         phantom.mode, phantom.window_s(1), phantom.window_s(2), phantom.trigger_time_s, phantom.trigAO, gateDesc);
 
 %% ---------------- shared state (used by nested functions) ---------------
-Data        = zeros(nAI + 1, N_total + 4 * round(fs * acq.notify_period_s));   % [t; AI...]
+% Stored as single: a 16-bit ADC has ~5 significant digits, far inside single's ~7,
+% so nothing is lost, and it halves both the in-memory array and the saved file
+% (192 -> 96 MB for a 90 s block). Row 1 carries block-relative time, whose spacing
+% must stay resolvable in single -- see the assert below.
+Data        = zeros(nAI + 1, N_total + 4 * round(fs * acq.notify_period_s), 'single');   % [t; AI...]
 wp          = 0;              % write pointer into Data
 samplesThisBlock = 0;
 currentBlock = 1;
 deviceID    = '';
 
 % plot state
+plotLive = false;        % runtime flag: the live figure exists and is usable.
+                         % plotting.enable stays the user's setting and is what gets
+                         % saved in params; losing the figure only clears plotLive.
 hFig = []; hRawAx = []; hEmgAx = []; hXAx = []; hLedAx = []; hSumAx = [];
 hRawLines = []; hEmgLine = []; hXLine = []; hYLine = [];
 hLED = []; hWBA = []; hWBF = []; hBasler = []; hPhRec = [];
@@ -369,7 +443,13 @@ if visual.cl_during_setup, arenaRest(); end
 %% ---------------- NI DAQ session ----------------------------------------
 aoCol = struct('led', 1, 'phantom', 0);
 if ~hw.simulate
-    if anyCam, imaqreset; closepreview; end
+    if anyCam
+        try                 % close stale previews first; imaqreset then clears the adaptor
+            closepreview;
+        catch
+        end
+        imaqreset;
+    end
     devices = daq.getDevices;
     assert(~isempty(devices), 'No NI DAQ devices found.');
     if isempty(hw.ni_device), deviceID = devices(1).ID; else, deviceID = hw.ni_device; end
@@ -506,7 +586,7 @@ end
 if ~exist(phantom.saveFolder, 'dir') && phantom.enable, mkdir(phantom.saveFolder); end
 
 %% ---------------- live figure ------------------------------------------
-if plotting.enable, initLivePlot(); end
+if plotting.enable, initLivePlot(); plotLive = true; end
 
 %% ---------------- run blocks -------------------------------------------
 if anyCam
@@ -553,8 +633,14 @@ for block = 1:acq.blocks
         mainSession.NotifyWhenDataAvailableExceeds = round(fs * acq.notify_period_s);
     end
 
-    if plotting.enable
-        drawBlockShading(block, rows, phantomPlanned && (phantom.record_each_block || block == phantom.block_to_record));
+    if plotAlive()
+        try
+            drawBlockShading(block, rows, phantomPlanned && (phantom.record_each_block || block == phantom.block_to_record));
+        catch ME
+            plotLive = false;
+            warning('run_session_unified:livePlot', ...
+                    'Block shading failed (%s); plotting disabled for the rest of the run.', ME.message);
+        end
     end
 
     % arena stimulus for this block
@@ -607,6 +693,11 @@ for block = 1:acq.blocks
         mainSession.stop();
     end
     arenaCmd('stop');
+    % Close the partial summary bin here, not just at the end of the run: global time
+    % jumps by TrialLength at a block boundary, so leftover samples carried across
+    % would be averaged into one bin straddling the discontinuity. A no-op whenever
+    % the chunk size divides evenly by plotting.bin_samples, which it does by default.
+    flushResidual();
     blockElapsed_s(block) = toc(tBlock);
     fprintf('  Block %d done in %.2f s, %d samples\n', block, blockElapsed_s(block), samplesThisBlock);
 
@@ -672,6 +763,7 @@ params.basler          = basler;
 params.plotting        = plotting;
 params.ni_device       = deviceID;
 params.data_rows       = [{'time_s'}, acq.ai_names];
+params.data_class      = class(Data);   % 'single' since 2026-09; cast on load if needed
 params.blockStartIdx   = blockStartIdx;
 params.blockStartTime  = blockStartTime;
 params.blockElapsed_s  = blockElapsed_s;
@@ -696,10 +788,17 @@ variables.CL_X_gain     = visual.CL_X_gain;
 
 fprintf('\nSaving %s ...\n', files.mat);
 saveArgs = {'Data', 'variables', 'allRandomizedStimOrders', 'stimTable', 'params', 'phantom', 'baslerInfo'};
-totalBytes = numel(Data) * 8;
-if totalBytes > 1.8e9, saveArgs{end + 1} = '-v7.3'; end
+% The default v7 format gzips the array. On analog noise that buys ~6 % while
+% costing ~3 s per 90 s block, and it scales with acq.blocks. Measured on a
+% 14 x 1.8e6 array: v7 2.9 s / 181 MB, -v7.3 4.2 s / 179 MB,
+% -v7.3 -nocompression 0.1 s / 192 MB. -nocompression is R2017a (9.2) and newer.
+% NOTE: v7.3 is HDF5. MATLAB load() is unaffected, but Python readers need h5py --
+% scipy.io.loadmat cannot read v7.3 files.
+saveArgs{end + 1} = '-v7.3';
+if ~verLessThan('matlab', '9.2'), saveArgs{end + 1} = '-nocompression'; end
+tSave = tic;
 save(files.mat, saveArgs{:});
-fprintf('Saved.\n');
+fprintf('Saved (%.1f s).\n', toc(tSave));
 
 %% ---------------- write Basler videos ----------------------------------
 % Each camera is isolated: one failing must not stop the other, the baslerInfo
@@ -732,13 +831,21 @@ if anyCam
 end
 
 %% ---------------- final plot -------------------------------------------
-if plotting.enable
+% The data is already on disk by this point, so a failure here costs only the
+% figure files: never let it skip the return value or the end-of-run sound.
+% (sgtitle is R2018b+, so this also covers older rig MATLAB releases.)
+if plotAlive()
+  try
     flushResidual();
     refreshSummary();
     sgtitle(hFig, FlyType, 'Color', 'w', 'Interpreter', 'none', 'FontSize', 9);
     drawnow;
     if plotting.save_svg, saveas(hFig, files.plot_svg, 'svg'); fprintf('Plot saved: %s\n', files.plot_svg); end
     if plotting.save_png, print(hFig, files.plot_png, '-dpng', '-r150'); fprintf('Plot saved: %s\n', files.plot_png); end
+  catch ME
+    warning('run_session_unified:finalPlot', ...
+            'Final plot failed: %s. The data in %s is unaffected.', ME.message, files.mat);
+  end
 end
 
 %% ---------------- done ------------------------------------------------
@@ -763,7 +870,32 @@ fprintf('\nAll done (%.1f s).\n', experimentElapsed_s);
         Data(2:nAI + 1, idx) = d(:, 1:nAI)';
         wp = wp + n;
         samplesThisBlock = samplesThisBlock + n;
-        if plotting.enable, updateLivePlot(t, d(:, 1:nAI)); end
+        % This runs inside the DataAvailable listener: nothing here may throw, or the
+        % error escapes the callback and aborts the whole session. The figure is
+        % operator-facing and can vanish at any moment (closed by hand, or a stray
+        % close all), and drawnow inside updateLivePlot can process that close
+        % mid-call -- hence the try/catch as well as the plotAlive() check.
+        if plotAlive()
+            try
+                updateLivePlot(t, d(:, 1:nAI));
+            catch ME
+                plotLive = false;
+                warning('run_session_unified:livePlot', ...
+                        'Live plot failed (%s); plotting disabled for the rest of the run. Acquisition continues.', ...
+                        ME.message);
+            end
+        end
+    end
+
+    function ok = plotAlive()
+        % True while the live figure exists and can be drawn into. The first time it
+        % is found gone, plotting is switched off for the remainder of the run so the
+        % experiment keeps going without a figure.
+        ok = plotLive && ~isempty(hFig) && isvalid(hFig);
+        if plotLive && ~ok
+            plotLive = false;
+            fprintf('Live figure closed; plotting disabled for the rest of the run (acquisition continues).\n');
+        end
     end
 
     function initLivePlot()
@@ -901,7 +1033,9 @@ fprintf('\nAll done (%.1f s).\n', experimentElapsed_s);
             set(hEmgLine, 'XData', t, 'YData', d(:, ch.emg)');
             set(hXLine,   'XData', t, 'YData', d(:, ch.arena_x)');
             set(hYLine,   'XData', t, 'YData', d(:, ch.arena_y)');
-            set([hRawAx hEmgAx hXAx], 'XLim', [t(1) t(end)]);
+            if numel(t) > 1          % a 1-sample chunk gives equal limits, which errors
+                set([hRawAx hEmgAx hXAx], 'XLim', [t(1) t(end)]);
+            end
         end
         tg = t(:) + (currentBlock - 1) * acq.TrialLength;              % global time
         resid = [resid; tg, 100 * d(:, ch.wbf), wbaRaw, d(:, ch.led), d(:, ch.basler_trig), d(:, ch.phantom_rec)];
@@ -1232,8 +1366,8 @@ fprintf('\nAll done (%.1f s).\n', experimentElapsed_s);
             catch
             end
             s = daq.createSession('ni');
-            for k = 1:numel(aoNames)
-                addAnalogOutputChannel(s, deviceID, aoNames{k}, 'Voltage');
+            for iAO = 1:numel(aoNames)
+                addAnalogOutputChannel(s, deviceID, aoNames{iAO}, 'Voltage');
             end
             outputSingleScan(s, z);
             fprintf('Analog outputs (%s) returned to 0 V.\n', strjoin(aoNames, ', '));
@@ -1294,21 +1428,92 @@ end   % run_session_unified
 
 %% ======================= LOCAL FUNCTIONS ================================
 
-function S = mergeStruct(S, O)
-% Recursively copy fields of O onto S.
+function S = mergeStruct(S, O, path)
+% Recursively copy the fields of O onto S, rejecting anything S does not already
+% define. Overrides are the documented calling API, so a misspelled field has to
+% fail loudly here -- before any hardware is touched -- rather than silently
+% leaving the default in force and running a different experiment than the caller
+% asked for. ov.hw.simluate = true used to add a dead field and run the rig.
+if nargin < 3, path = ''; end
 if ~isstruct(O) || ~isstruct(S), S = O; return; end
-f = fieldnames(O);
+f     = fieldnames(O);
+valid = fieldnames(S);
 for i = 1:numel(f)
-    if isfield(S, f{i}) && isstruct(S.(f{i})) && isstruct(O.(f{i}))
-        S.(f{i}) = mergeStruct(S.(f{i}), O.(f{i}));
+    name = f{i};
+    if isempty(path)
+        here = name;              lvl = 'the top level';
     else
-        S.(f{i}) = O.(f{i});
+        here = [path '.' name];   lvl = path;
+    end
+    if ~isfield(S, name)
+        error('run_session_unified:unknownOverride', ...
+              ['Unknown override field "%s".%s\nValid fields at %s: %s\n' ...
+               'Add it to the USER SETTINGS block first if it is genuinely new.'], ...
+              here, suggestField(name, valid), lvl, strjoin(valid', ', '));
+    end
+    sIsStruct = isstruct(S.(name));
+    oIsStruct = isstruct(O.(name));
+    if sIsStruct && oIsStruct
+        S.(name) = mergeStruct(S.(name), O.(name), here);
+    elseif sIsStruct
+        error('run_session_unified:overrideType', ...
+              'Override "%s" must be a struct of sub-fields (%s), got a %s.', ...
+              here, strjoin(fieldnames(S.(name))', ', '), class(O.(name)));
+    elseif oIsStruct
+        error('run_session_unified:overrideType', ...
+              'Override "%s" must be a %s value like the default, not a struct.', ...
+              here, class(S.(name)));
+    else
+        S.(name) = O.(name);
     end
 end
 end
 
+function s = suggestField(name, valid)
+% Hint for the error above: catches case slips, transpositions and singular/plural.
+d   = cellfun(@(v) editDistance(name, v), valid);
+tol = max(2, ceil(numel(name) / 4));
+keep = d <= tol;
+if ~any(keep), s = ''; return; end
+hit = valid(keep);
+[~, ord] = sort(d(keep));
+hit = hit(ord);
+s = sprintf(' Did you mean "%s"?', strjoin(hit(1:min(3, numel(hit)))', '" or "'));
+end
+
+function d = editDistance(a, b)
+% Plain Levenshtein; only ever runs on the error path, so clarity beats speed.
+a = lower(a); b = lower(b);
+m = numel(a); n = numel(b);
+D = zeros(m + 1, n + 1);
+D(:, 1) = (0:m)';
+D(1, :) = 0:n;
+for ii = 1:m
+    for jj = 1:n
+        D(ii + 1, jj + 1) = min([D(ii, jj + 1) + 1, D(ii + 1, jj) + 1, D(ii, jj) + (a(ii) ~= b(jj))]);
+    end
+end
+d = D(m + 1, n + 1);
+end
+
 function s = prefixIfNonEmpty(prefix, value)
-if isempty(value), s = ''; else, s = [prefix value]; end
+t = asText(value);
+if isempty(t), s = ''; else, s = [prefix t]; end
+end
+
+function s = asText(v)
+% Metadata can arrive as a number through overrides (ov.meta.flyNumber = 1), where
+% [prefix value] would splice in a character code instead of the digits -- 'Fly'
+% followed by char(1) rather than 'Fly1'.
+if ischar(v)
+    s = v;
+elseif isstring(v) || iscellstr(v)
+    s = char(v);
+elseif isempty(v)
+    s = '';
+else
+    s = num2str(v);
+end
 end
 
 function s = niceName(name)
@@ -1354,8 +1559,8 @@ order = durs(p); amps = amps(p);
 onsets = round((TrialLength / (n + 1)) * (1:n) * fs);      % sample offsets (0-based)
 for i = 1:n
     nStim = round(fs * order(i) / 1000);
-    sig = placeTrain(sig, onsets(i), nStim, amps(i), opto.period_samples, opto.on_samples);
-    rows(i, :) = [onsets(i) / fs, (onsets(i) + nStim) / fs, order(i), amps(i), 1];
+    [sig, endSamp] = placeTrain(sig, onsets(i), nStim, amps(i), fs, opto.Frequency, opto.duty_cycle);
+    rows(i, :) = [onsets(i) / fs, endSamp / fs, order(i), amps(i), 1];   % endSamp = as delivered
 end
 end
 
@@ -1371,20 +1576,27 @@ durs_ms = round(diff(W, 1, 2)' * 1000);
 for i = 1:n
     on0   = round(W(i, 1) * fs);
     nStim = round((W(i, 2) - W(i, 1)) * fs);
-    sig = placeTrain(sig, on0, nStim, amps(i), opto.period_samples, opto.on_samples);
-    rows(i, :) = [on0 / fs, (on0 + nStim) / fs, durs_ms(i), amps(i), 2];
+    [sig, endSamp] = placeTrain(sig, on0, nStim, amps(i), fs, opto.Frequency, opto.duty_cycle);
+    rows(i, :) = [on0 / fs, endSamp / fs, durs_ms(i), amps(i), 2];   % endSamp = as delivered
 end
 end
 
-function sig = placeTrain(sig, onset0, nStim, amp, period, onS)
+function [sig, endSamp] = placeTrain(sig, onset0, nStim, amp, fs, frequency, dutyCycle)
+% Write one gated burst into sig at 0-based sample offset onset0, clipped to the
+% end of the block. The carrier comes from the shared pulseTrain kernel, so the
+% realised rate stays exact and a sub-sample pulse width raises an error instead
+% of silently producing an all-zero burst. Only the clipped length is generated.
+%
+% endSamp is the last sample the burst actually occupies after clipping, so the
+% caller can log what was delivered rather than what was asked for. A sham (0 V,
+% or 0 ms) still reports its nominal window: the epoch occupies time even though
+% no light comes out, and stimTable has to mark it.
+endSamp = min(numel(sig), onset0 + max(0, nStim));
 if nStim <= 0 || amp == 0, return; end
-cycle = [amp * ones(onS, 1); zeros(period - onS, 1)];
-train = repmat(cycle, ceil(nStim / period), 1);
-train = train(1:nStim);
 i0 = onset0 + 1;
 i1 = min(numel(sig), onset0 + nStim);
 if i1 < i0, return; end
-sig(i0:i1) = train(1:(i1 - i0 + 1));
+sig(i0:i1) = pulseTrain(i1 - i0 + 1, amp, fs, frequency, dutyCycle);
 end
 
 function [riseTimes, fallTimes, onTime, offTime] = gateEdges(t, gate)
