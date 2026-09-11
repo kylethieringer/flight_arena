@@ -440,7 +440,15 @@ phantom.save_time_s    = nan(acq.blocks, 1);
 phantom.init_ok = false;
 baslerInfo = struct();
 
-cleanupObj = onCleanup(@() cleanupAll());   % runs on normal exit, error, or Ctrl+C
+% Everything the teardown needs is registered in teardownState (a handle) as it is
+% created, and teardownAll is a local, not nested, function that reads only that.
+% MATLAB clears this function's variables -- the ones nested functions share --
+% before an onCleanup task runs at exit (normal, error and Ctrl+C alike), so a nested
+% teardown found hw, mainSession, vids, ... already destroyed and stopped before it
+% had zeroed the analog outputs or released anything.
+teardownState = containers.Map();
+teardownState('simulate') = hw.simulate;
+cleanupObj = onCleanup(@() teardownAll(teardownState));   % runs on normal exit, error, or Ctrl+C
 
 %% ---------------- arena: closed loop while everything loads ------------
 if visual.cl_during_setup, arenaRest(); end
@@ -459,8 +467,11 @@ if ~hw.simulate
     assert(~isempty(devices), 'No NI DAQ devices found.');
     if isempty(hw.ni_device), deviceID = devices(1).ID; else, deviceID = hw.ni_device; end
     fprintf('NI device  : %s\n', deviceID);
+    teardownState('deviceID') = deviceID;
+    teardownState('aoNames')  = {opto.ao};        % outputs the teardown returns to 0 V
 
     mainSession = daq.createSession('ni');
+    teardownState('mainSession') = mainSession;
     aiCh = addAnalogInputChannel(mainSession, deviceID, acq.ai_channels, 'Voltage');
     set(aiCh, 'TerminalConfig', acq.terminal_config);
     fprintf('AI channels: %s, %s\n', mat2str(acq.ai_channels), acq.terminal_config);
@@ -468,6 +479,7 @@ if ~hw.simulate
     if phantom.enable
         addAnalogOutputChannel(mainSession, deviceID, phantom.trigAO, 'Voltage'); % column 2 = Phantom trigger
         aoCol.phantom = 2;
+        teardownState('aoNames') = {opto.ao, phantom.trigAO};
     end
     if anyCam
         camTrigger = addCounterOutputChannel(mainSession, deviceID, basler.trigger_ctr, 'PulseGeneration');
@@ -491,6 +503,7 @@ if ~hw.simulate
     % NotifyWhenDataAvailableExceeds is set per block right after queueOutputData:
     % with analog output channels in the session it cannot be set before data is queued.
     lh = addlistener(mainSession, 'DataAvailable', @onDataAvailable);
+    teardownState('lh') = lh;
 end
 
 %% ---------------- Basler cameras ----------------------------------------
@@ -518,18 +531,18 @@ if anyCam
                'close Pylon Viewer / other GenTL clients, or set basler.<camera>.enable = false.'], ...
               strjoin(missing, ', '), basler.discover_timeout_s);
     end
-    if basler.top.enable,  [vids.top,  srcs.top]  = setupBasler('top',  camInfo, files.top_video);  end
-    if basler.side.enable, [vids.side, srcs.side] = setupBasler('side', camInfo, files.side_video); end
+    if basler.top.enable,  [vids.top,  srcs.top]  = setupBasler('top',  camInfo, files.top_video);  teardownState('vids') = vids; end
+    if basler.side.enable, [vids.side, srcs.side] = setupBasler('side', camInfo, files.side_video); teardownState('vids') = vids; end
 end
 
 %% ---------------- Phantom connect / configure ---------------------------
 if phantom.enable
     try
         LoadPhantomLibraries();
-        ph.libsLoaded = true;
-        ph.pb = PoolBuilder([]);
+        ph.libsLoaded = true;       teardownState('ph') = ph;
+        ph.pb = PoolBuilder([]);    teardownState('ph') = ph;
         ph.pb.Register();
-        ph.pr = PoolRefresher();
+        ph.pr = PoolRefresher();    teardownState('ph') = ph; %#ok<NASGU> -- a handle the teardown reads
 
         t0 = tic; lastN = -1;
         while toc(t0) < phantom.discover_timeout_s
@@ -1347,91 +1360,103 @@ fprintf('\nAll done (%.1f s).\n', experimentElapsed_s);
         end
     end
 
-    function zeroAnalogOutputs()
-        % Drive every analog output back to 0 V. NI-DAQmx holds the last written
-        % sample when a task is stopped or released, so aborting mid-stimulus would
-        % otherwise leave the LED driver latched at opto.amplitude_V until MATLAB
-        % restarts. Fast path: an on-demand scan on mainSession. If that is rejected
-        % (the session also owns the ctr0 PulseGeneration channel), release it and
-        % take the channels with a short-lived AO-only session instead.
-        if hw.simulate || isempty(deviceID), return; end
-        aoNames = {opto.ao};
-        if aoCol.phantom > 0, aoNames{end + 1} = phantom.trigAO; end
-        z = zeros(1, numel(aoNames));
-        try
-            outputSingleScan(mainSession, z);
-            fprintf('Analog outputs (%s) returned to 0 V.\n', strjoin(aoNames, ', '));
-            return;
-        catch
-        end
-        s = [];
-        try
-            try
-                if ~isempty(mainSession), release(mainSession); end
-            catch
-            end
-            s = daq.createSession('ni');
-            for iAO = 1:numel(aoNames)
-                addAnalogOutputChannel(s, deviceID, aoNames{iAO}, 'Voltage');
-            end
-            outputSingleScan(s, z);
-            fprintf('Analog outputs (%s) returned to 0 V.\n', strjoin(aoNames, ', '));
-        catch ME
-            warning('run_session_unified:aoZero', ...
-                    'Could not return %s to 0 V: %s. CHECK THE LED DRIVER MANUALLY.', ...
-                    strjoin(aoNames, ', '), ME.message);
-        end
-        try
-            if ~isempty(s), release(s); end
-        catch
-        end
-    end
-
-    function cleanupAll()
-        % Idempotent teardown: safe to call after a normal run, an error, or Ctrl+C.
-        try
-            if ~isempty(lh), delete(lh); end
-        catch
-        end
-        try
-            if ~isempty(mainSession), stop(mainSession); end
-        catch
-        end
-        zeroAnalogOutputs();          % before release: the fast path needs a live session
-        try
-            if ~isempty(mainSession), release(mainSession); end
-        catch
-        end
-        for camKey = {'top', 'side'}
-            try
-                v = vids.(camKey{1});
-                if ~isempty(v) && isvalid(v), stop(v); delete(v); end
-            catch
-            end
-        end
-        try
-            if ~isempty(ph.pr), ph.pr.delete(); end
-        catch
-        end
-        try
-            if ~isempty(ph.pb)
-                try
-                    if ph.pb.IsRegistered, ph.pb.Unregister(); end
-                catch
-                end
-                ph.pb.delete();
-            end
-        catch
-        end
-        try
-            if ph.libsLoaded, UnloadPhantomLibraries(); end
-        catch
-        end
-    end
-
 end   % run_session_unified
 
 %% ======================= LOCAL FUNCTIONS ================================
+
+function teardownAll(state)
+% Idempotent teardown: safe after a normal run, an error, or Ctrl+C. It reads only
+% state (see where teardownState is created): by the time an onCleanup task runs,
+% run_session_unified's own variables may already have been cleared.
+lh          = entry(state, 'lh');
+mainSession = entry(state, 'mainSession');
+vids        = entry(state, 'vids');
+ph          = entry(state, 'ph');
+try
+    if ~isempty(lh), delete(lh); end
+catch
+end
+try
+    if ~isempty(mainSession), stop(mainSession); end
+catch
+end
+zeroAnalogOutputs(state);     % before release: the fast path needs a live session
+try
+    if ~isempty(mainSession), release(mainSession); end
+catch
+end
+for camKey = {'top', 'side'}
+    try
+        v = vids.(camKey{1});
+        if ~isempty(v) && isvalid(v), stop(v); delete(v); end
+    catch
+    end
+end
+try
+    if ~isempty(ph.pr), ph.pr.delete(); end
+catch
+end
+try
+    if ~isempty(ph.pb)
+        try
+            if ph.pb.IsRegistered, ph.pb.Unregister(); end
+        catch
+        end
+        ph.pb.delete();
+    end
+catch
+end
+try
+    if ph.libsLoaded, UnloadPhantomLibraries(); end
+catch
+end
+end
+
+function zeroAnalogOutputs(state)
+% Drive every analog output back to 0 V. NI-DAQmx holds the last written sample when
+% a task is stopped or released, so aborting mid-stimulus would otherwise leave the
+% LED driver latched at opto.amplitude_V until MATLAB restarts. Fast path: an
+% on-demand scan on the session. If that is rejected (the session also owns the ctr0
+% PulseGeneration channel), release it and take the channels with a short-lived
+% AO-only session instead.
+mainSession = entry(state, 'mainSession');
+deviceID    = entry(state, 'deviceID');
+aoNames     = entry(state, 'aoNames');
+if isequal(entry(state, 'simulate'), true) || isempty(deviceID), return; end
+z = zeros(1, numel(aoNames));
+try
+    outputSingleScan(mainSession, z);
+    fprintf('Analog outputs (%s) returned to 0 V.\n', strjoin(aoNames, ', '));
+    return;
+catch
+end
+s = [];
+try
+    try
+        if ~isempty(mainSession), release(mainSession); end
+    catch
+    end
+    s = daq.createSession('ni');
+    for iAO = 1:numel(aoNames)
+        addAnalogOutputChannel(s, deviceID, aoNames{iAO}, 'Voltage');
+    end
+    outputSingleScan(s, z);
+    fprintf('Analog outputs (%s) returned to 0 V.\n', strjoin(aoNames, ', '));
+catch ME
+    warning('run_session_unified:aoZero', ...
+            'Could not return %s to 0 V: %s. CHECK THE LED DRIVER MANUALLY.', ...
+            strjoin(aoNames, ', '), ME.message);
+end
+try
+    if ~isempty(s), release(s); end
+catch
+end
+end
+
+function v = entry(state, key)
+% state(key), or [] for a resource that was never created.
+if isKey(state, key), v = state(key); else, v = []; end
+end
 
 function S = mergeStruct(S, O, path)
 % Recursively copy the fields of O onto S, rejecting anything S does not already
