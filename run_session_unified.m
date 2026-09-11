@@ -16,6 +16,8 @@ function out = run_session_unified(overrides)
 %                                       % USER SETTINGS: an unknown or misspelled one
 %                                       % is an error, not a silently ignored default.
 %   out = run_session_unified(...)      % returns Data, params and results (in ans if not captured)
+%   S = run_session_unified('defaults') % the USER SETTINGS as one struct; runs nothing
+%   run_session_gui                     % window for editing the USER SETTINGS, then Run
 %
 % MODES (all selected in the USER SETTINGS block)
 %   visual.mode : 'closed_loop_stripe'      pattern + closed-loop X gain
@@ -62,9 +64,11 @@ function out = run_session_unified(overrides)
 %   Phantom sequence: <phantom.saveRoot>\<experiment_name>\<base>_PhantomCamera
 %
 % Author: Yichen Luo, 2026-09 (unified version)
+% edits: Kyle Thieringer, 2026-09
 
 if nargin < 1 || isempty(overrides), overrides = struct(); end
-close all; clc
+defaultsOnly = (ischar(overrides) || isstring(overrides)) && strcmpi(overrides, 'defaults');
+if ~defaultsOnly, close all; clc; end
 
 %% ======================= USER SETTINGS ==================================
 saveFolder = ['H:\.shortcut-targets-by-id\10pxdlRXtzFB-abwDGi0jOGOFFNm3pmFK\Tuthill Lab Shared\Yichen\', ...
@@ -201,6 +205,7 @@ plotting.save_png    = true;
 %% ---------------- apply overrides, derive settings, validate -------------
 S = struct('saveFolder', saveFolder, 'meta', meta, 'hw', hw, 'acq', acq, 'visual', visual, ...
            'opto', opto, 'basler', basler, 'phantom', phantom, 'plotting', plotting);
+if defaultsOnly, out = S; return; end   % the settings above, exactly as overrides take them; nothing run
 S = mergeStruct(S, overrides);
 saveFolder = S.saveFolder; meta = S.meta; hw = S.hw; acq = S.acq; visual = S.visual;
 opto = S.opto; basler = S.basler; phantom = S.phantom; plotting = S.plotting;
