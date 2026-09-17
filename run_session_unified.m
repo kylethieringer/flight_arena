@@ -57,10 +57,13 @@ function out = run_session_unified(overrides)
 %   <base>.mat             Data (14 x N), variables, allRandomizedStimOrders,
 %                          stimTable, params, phantom, baslerInfo
 %   <base>_plot.svg/.png   summary figure
-%   <base>_TopCamera.avi, <base>_SideCamera.avi   (Motion JPEG AVI, streamed to
-%                          disk during acquisition; see basler.video_profile.
-%                          Only 180 deg rotation is baked in, on-camera -- check
-%                          baslerInfo.<cam>.rotate_deg_pending before tracking)
+%   <base>_TopCamera.mp4, <base>_SideCamera.mp4   (H.264). During the run the frames
+%                          stream uncompressed (basler.video_profile) to
+%                          basler.video_scratch_folder on a local NVMe; after the .mat is
+%                          saved, ffmpeg compresses each file (basler.h264), applying the
+%                          rotate_deg that could not be done on-camera, and the mp4 is
+%                          moved here. Check baslerInfo.<cam>.rotate_deg_pending: 0 means
+%                          the video is already oriented as configured.
 %   Phantom sequence: <phantom.saveRoot>\<experiment_name>\<base>_PhantomCamera
 %
 % Author: Yichen Luo, 2026-09 (unified version)
@@ -71,18 +74,17 @@ defaultsOnly = (ischar(overrides) || isstring(overrides)) && strcmpi(overrides, 
 if ~defaultsOnly, close all; clc; end
 
 %% ======================= USER SETTINGS ==================================
-saveFolder = ['H:\.shortcut-targets-by-id\10pxdlRXtzFB-abwDGi0jOGOFFNm3pmFK\Tuthill Lab Shared\Yichen\', ...
-              'Spiracle\Flight_Arena_Data\260910_test\'];
+saveFolder = 'K:\sanjana\dat\Raw\R71F05';
 
 % --- Fly / experiment metadata (non-empty fields build the file name, in this order) ---
-meta.experiment_name   = 'test';           % e.g. SpINB_ChR
-meta.genotype          = '';      % e.g. IS46338_ChR_4d_F
-meta.flyNumber         = '1';
+meta.experiment_name   = 'R71F05_ChR';     % e.g. SpINB_ChR
+meta.genotype          = 'R71F05';  % e.g. IS46338_ChR_4d_F
+meta.flyNumber         = 'ba04';
 meta.trialNum          = '4';
-meta.stimulus_regime   = '0ms';                   % e.g. 0-3000ms, 3000msx3, 10000ms
+meta.stimulus_regime   = '2/5ms';                 % e.g. 0-3000ms, 3000msx3, 10000ms
 meta.stimulus_position = 'thorax';
-meta.phantom_position  = 'sp1';                   % sp1, sp2, wing, ''
-meta.visual_stim_type  = 'oscillating_sine_wave_20';
+meta.phantom_position  = '';                      % sp1, sp2, wing, ''
+meta.visual_stim_type  = 'closed loop stripe';
 meta.carbon_dioxide    = 'OFF';
 meta.auto_trial_number = false;   % true: trialNum = 1 + #existing .mat files for this fly in saveFolder
 meta.notes             = '';
@@ -95,8 +97,8 @@ hw.panel_pause = 0.005;   % s between Panel_com commands
 hw.play_sound_at_end = true;
 
 % --- Acquisition ---
-acq.SampleRate      = 20000;   % Hz
-acq.TrialLength     = 90;     % s per block
+acq.SampleRate      = 10000;   % Hz
+acq.TrialLength     = 30;     % s per block
 acq.blocks          = 1;
 acq.ai_channels     = [0:11 14];
 acq.ai_names        = {'LED_driver','WBF','WBA_left','WBA_right','hutchen_left','hutchen_right', ...
@@ -110,8 +112,8 @@ acq.notify_period_s = 0.1;     % DataAvailable callback period (plot update rate
 %   13 = horizontal stripes + smooth vertical bar, 2 = horizontal stripes.
 % Velocity functions: 4 = sine 0.025 Hz, 5 = sine 0.05 Hz, 6 = sine 0.2 Hz,
 %   8 = sine 1 Hz, 9-14 = square waves (amp1/2/3 at 0.05 / 0.1 Hz).
-visual.mode        = 'closed_loop_oscillating'; % 'closed_loop_stripe' | 'closed_loop_oscillating' | 'none'
-visual.pattern_id  = 2;
+visual.mode        = 'closed_loop_stripe';      % 'closed_loop_stripe' | 'closed_loop_oscillating' | 'none'
+visual.pattern_id  = 14;
 visual.CL_X_gain   = -5;
 visual.x_pos       = 48;        % start X position (used in stripe mode)
 visual.mode_xy     = [1 0];     % Panel_com set_mode: X closed loop, Y open loop
@@ -120,7 +122,7 @@ visual.funcy_freq  = 50;        % oscillating mode: Y function update rate (Hz)
 visual.y_gain      = 20;        % oscillating mode: pixels/s
 visual.y_bias      = 0;
 visual.cl_during_setup = true;  % closed-loop stripe while cameras/Phantom initialise (fly fixates)
-visual.rest.pattern_id = 13;    % arena state before setup and after the experiment
+visual.rest.pattern_id = 14;    % arena state before setup and after the experiment
 visual.rest.x_pos      = 48;
 visual.rest.CL_X_gain  = -5;
 
@@ -129,13 +131,13 @@ opto.mode              = 'both';     % 'randomized' | 'windows' | 'both' | 'none
 opto.ao                = 'ao0';
 opto.Frequency         = 200;           % pulse rate (Hz)
 opto.PulseDuration     = 3;             % pulse width (ms); >= 1000/Frequency gives continuous light
-opto.amplitude_V       = 10;            % default LED command voltage
+opto.amplitude_V       = 5;             % default LED command voltage
 % randomized mode: durations (ms), evenly spaced at TrialLength/(n+1); 0 = sham
-opto.stimDurations     = [0 3000 3000];
+opto.stimDurations     = [0 2000 5000];
 opto.stimIntensities_V = [];            % [] = amplitude_V for all; else one voltage per duration (paired)
 opto.randomize         = true;          % shuffle order every block
 % windows mode: explicit [onset offset] rows in seconds within the block
-opto.windows_s         = [88, 88.5];
+opto.windows_s         = [28 28.5];
 opto.windows_amplitude_V = [];          % [] = amplitude_V; else one voltage per row
 
 % --- Basler cameras (hardware-triggered by ctr0) ---
@@ -145,17 +147,38 @@ basler.trigger_ctr             = 'ctr0';
 basler.trigger_initial_delay_s = 0.05;
 basler.format                  = 'Mono8';
 % Frames stream to disk during acquisition (LoggingMode = 'disk' + DiskLogger), so
-% nothing is buffered in RAM and there is no post-experiment encode. Motion JPEG AVI
-% is fixed by docs/superpowers/specs/2026-07-27-video-save-streaming-design.md: fast
-% per-frame encode, no inter-frame compression, read natively by DeepLabCut / SLEAP.
-basler.video_profile           = 'Motion JPEG AVI';
-basler.video_quality           = 90;
+% nothing is buffered in RAM. The stream is UNCOMPRESSED: the disk logger hands every
+% frame to a MATLAB VideoWriter on the MATLAB thread, and MATLAB's Motion JPEG encoder
+% measured only 109 fps (top, 640x512) / 75 fps (side, 800x600) on this PC against the
+% 400 fps two cameras deliver -- the interpreter saturated, the live plot and DAQ
+% callbacks stalled and frames were dropped (2026-09-15). Grayscale AVI measured
+% 765 / 636 fps and ~160 MB/s total, well inside the NVMe. Compression happens after
+% the run with ffmpeg (basler.h264 below).
+basler.video_profile           = 'Grayscale AVI';   % 'Grayscale AVI' (uncompressed) | 'Motion JPEG AVI' | 'MPEG-4'
+basler.video_quality           = 90;    % only used by profiles with a Quality property (Motion JPEG AVI, MPEG-4)
 basler.discover_timeout_s      = 5;     % wait up to this long for the cameras to enumerate after imaqreset
 basler.disk_flush_timeout_s    = 30;    % wait up to this long for the disk logger to drain after stop
+% The videos stream to this LOCAL folder during the run and are moved into saveFolder
+% after the .mat is saved. saveFolder lives on Google Drive File Stream (H:), and
+% pushing two Motion JPEG streams through it from the acquisition thread stalled the
+% live plot and the whole session (2026-09-15). Keep this on a local NVMe drive;
+% '' writes straight into saveFolder.
+basler.video_scratch_folder    = 'K:\FlightArena_scratch\';
+% After the .mat is saved, each raw AVI in the scratch folder is compressed to H.264
+% mp4 with ffmpeg on all cores (~15 s per 18000 frames of 800x600 here), the pending
+% rotation is applied in the same pass, the raw file is deleted and the mp4 is moved
+% into saveFolder. If ffmpeg fails the raw AVI stays in the scratch folder and
+% baslerInfo.<cam>.file points at it.
+basler.h264.enable       = true;
+basler.h264.ffmpeg       = 'C:\Users\Lylah\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-7.1.1-full_build\bin\ffmpeg.exe';   % '' = the ffmpeg on PATH
+basler.h264.crf          = 18;          % libx264 quality: 0 lossless, 18 visually lossless, 23 ffmpeg default
+basler.h264.preset       = 'veryfast';  % slower presets give smaller files for a longer encode
+basler.h264.pixel_format = 'yuv420p';   % plays everywhere; 'gray' is a little smaller but not every reader opens it
+basler.h264.keep_raw     = false;       % true: also leave the uncompressed AVI in video_scratch_folder
 % rotate_deg: clockwise rotation the video should end up with (0, 90, 180 or 270).
-% Disk logging writes frames straight from the camera, so only 180 deg can actually be
-% baked in (on-camera ReverseX + ReverseY). 90/270 have no GenICam equivalent and are
-% recorded as baslerInfo.<cam>.rotate_deg_pending for analysis to apply.
+% Disk logging writes frames straight from the camera, so only 180 deg can be baked in
+% on-camera (ReverseX + ReverseY). 90/270 are applied by the ffmpeg pass above; with
+% h264.enable = false they stay in baslerInfo.<cam>.rotate_deg_pending for analysis.
 basler.top  = struct('enable', true,  'label', 'TopCamera',  'serial', '22703705', ...
                      'gain', 5,  'gamma', 0.5, 'binning', 2, ...
                      'rotate_deg', 90,  'exposure_active_out', false, 'line_inverter', 'False');
@@ -164,12 +187,12 @@ basler.side = struct('enable', true,  'label', 'SideCamera', 'serial', '22843477
                      'rotate_deg', 180, 'exposure_active_out', true,  'line_inverter', 'False');
 
 % --- Phantom KT810 ---
-phantom.enable        = true;
-phantom.mode          = 'fixed_fps';  % 'framesync' | 'fixed_fps'
+phantom.enable        = false;
+phantom.mode          = 'framesync';  % 'framesync' | 'fixed_fps' - need to also set Phantom PCC to "external"
 phantom.serial        = 34437;
 phantom.fps           = 100;         % framesync: metadata only (external clock); fixed_fps: set on camera
 phantom.exposure_us   = 150;
-phantom.window_s      = [10 20];      % [capture start, trigger] for framesync / fixed 'end'; [trigger, end] for fixed 'start'
+phantom.window_s      = [5 15];      % [capture start, trigger] for framesync / fixed 'end'; [trigger, end] for fixed 'start'
 phantom.trigger_at    = 'end';        % fixed_fps only: 'end' (pre-trigger buffer) | 'start' (post-trigger frames)
 phantom.pt_frames     = 10;           % fixed_fps + 'end': small post-trigger buffer
 phantom.arm_lead_s    = 0.5;          % start capture / arm this long before window_s(1)
@@ -195,11 +218,17 @@ plotting.ch = struct('led', 1, 'wbf', 2, 'wbaL', 3, 'wbaR', 4, 'hutchen_left', 5
                      'basler_shutter', 12, 'phantom_rec', 13);
 plotting.wba_gain    = 20;     % delta WBA (V) is multiplied by this to share the delta WBF (Hz) axis
 plotting.trigger_threshold_V = 2.5;   % Basler trigger loop-back above this = camera recording
-plotting.bin_samples = 100;    % summary traces = block means of this many samples (100 -> 200 Hz)
+plotting.bin_samples = 100;    % summary traces = block means of this many samples 
 plotting.baseline_s  = 5;      % baseline window for delta WBF / WBA (first seconds of the experiment)
 plotting.ylim        = [-100 50];
 plotting.save_svg    = true;
 plotting.save_png    = true;
+% When the run is over, open session_overview on the saved .mat: every channel in its
+% own panel, linked zoom/pan in time, opto and Phantom windows overlaid. Nothing is
+% saved; it is for checking the trial. Dense pulse trains (Basler trigger, F-Sync)
+% look like a solid band until you zoom in.
+plotting.session_overview = true;
+plotting.overview_channels = 'all';   % 'all', or a list like {'WBF', {'WBA_left', 'WBA_right'}, 'basler_trigger'}
 %% ===================== END USER SETTINGS ================================
 
 %% ---------------- apply overrides, derive settings, validate -------------
@@ -365,8 +394,21 @@ switch lower(basler.video_profile)                      % container matched to t
     otherwise,                                  vidExt = '.avi';
 end
 basler.video_ext = vidExt;
-files.top_video  = fullfile(saveFolder, [baseFileName '_' basler.top.label vidExt]);
-files.side_video = fullfile(saveFolder, [baseFileName '_' basler.side.label vidExt]);
+if basler.h264.enable, finalExt = '.mp4'; else, finalExt = vidExt; end
+files.top_video  = fullfile(saveFolder, [baseFileName '_' basler.top.label finalExt]);   % final location
+files.side_video = fullfile(saveFolder, [baseFileName '_' basler.side.label finalExt]);
+% Where the DiskLogger actually writes during the run (see basler.video_scratch_folder),
+% and where the ffmpeg pass puts its mp4 before the move.
+if isempty(basler.video_scratch_folder), scratchDir = saveFolder; else, scratchDir = basler.video_scratch_folder; end
+if anyCam && ~exist(scratchDir, 'dir'), mkdir(scratchDir); end
+files.top_video_scratch  = fullfile(scratchDir, [baseFileName '_' basler.top.label vidExt]);
+files.side_video_scratch = fullfile(scratchDir, [baseFileName '_' basler.side.label vidExt]);
+files.top_video_h264     = fullfile(scratchDir, [baseFileName '_' basler.top.label '.mp4']);
+files.side_video_h264    = fullfile(scratchDir, [baseFileName '_' basler.side.label '.mp4']);
+if anyCam && basler.h264.enable
+    % Fail here, before any hardware is touched, rather than after a whole session.
+    compress_video_h264_check(basler.h264.ffmpeg);
+end
 if strcmpi(phantom.save_format, 'cine')
     files.phantom = fullfile(phantom.saveFolder, [baseFileName '_PhantomCamera.cine']);
 else
@@ -531,8 +573,8 @@ if anyCam
                'close Pylon Viewer / other GenTL clients, or set basler.<camera>.enable = false.'], ...
               strjoin(missing, ', '), basler.discover_timeout_s);
     end
-    if basler.top.enable,  [vids.top,  srcs.top]  = setupBasler('top',  camInfo, files.top_video);  teardownState('vids') = vids; end
-    if basler.side.enable, [vids.side, srcs.side] = setupBasler('side', camInfo, files.side_video); teardownState('vids') = vids; end
+    if basler.top.enable,  [vids.top,  srcs.top]  = setupBasler('top',  camInfo, files.top_video_scratch);  teardownState('vids') = vids; end
+    if basler.side.enable, [vids.side, srcs.side] = setupBasler('side', camInfo, files.side_video_scratch); teardownState('vids') = vids; end
 end
 
 %% ---------------- Phantom connect / configure ---------------------------
@@ -823,20 +865,34 @@ fprintf('Saved (%.1f s).\n', toc(tSave));
 % append, or the summary plot. The DAQ data is already on disk at this point.
 if ~isempty(vids.top)
     try
-        baslerInfo.top = writeCameraVideo(vids.top, srcs.top, basler.top, files.top_video);
+        baslerInfo.top = writeCameraVideo(vids.top, srcs.top, basler.top, files.top_video_scratch);
     catch ME
         warning('run_session_unified:videoWrite', '%s: video write failed: %s', basler.top.label, ME.message);
     end
 end
 if ~isempty(vids.side)
     try
-        baslerInfo.side = writeCameraVideo(vids.side, srcs.side, basler.side, files.side_video);
+        baslerInfo.side = writeCameraVideo(vids.side, srcs.side, basler.side, files.side_video_scratch);
     catch ME
         warning('run_session_unified:videoWrite', '%s: video write failed: %s', basler.side.label, ME.message);
     end
 end
-if ~isempty(vids.top),  delete(vids.top);  vids.top  = []; end
+if ~isempty(vids.top),  delete(vids.top);  vids.top  = []; end   % closes the DiskLogger file
 if ~isempty(vids.side), delete(vids.side); vids.side = []; end
+
+% Compress (ffmpeg, H.264, pending rotation applied) and move the finished videos from
+% the local scratch folder into saveFolder. Done only now, with the cameras released
+% and the .mat already saved, so a slow encode or Google Drive copy can cost time but
+% never data. On any failure the file stays in scratch and baslerInfo.<cam>.file says
+% where it is.
+if isfield(baslerInfo, 'top')
+    [baslerInfo.top, srcFile] = compressVideo(baslerInfo.top, files.top_video_scratch, files.top_video_h264, basler.h264);
+    baslerInfo.top = moveVideoToSaveFolder(baslerInfo.top, srcFile, files.top_video);
+end
+if isfield(baslerInfo, 'side')
+    [baslerInfo.side, srcFile] = compressVideo(baslerInfo.side, files.side_video_scratch, files.side_video_h264, basler.h264);
+    baslerInfo.side = moveVideoToSaveFolder(baslerInfo.side, srcFile, files.side_video);
+end
 
 if anyCam
     try
@@ -873,6 +929,17 @@ out = struct('Data', Data, 'variables', variables, 'params', params, 'phantom', 
 
 if hw.play_sound_at_end && ~hw.simulate, playEndSound(); end
 fprintf('\nAll done (%.1f s).\n', experimentElapsed_s);
+
+% Last, once MATLAB has nothing else to do, so the window is responsive at once.
+% Reads the file just written, so it shows exactly what was saved.
+if plotting.session_overview
+    try
+        session_overview(files.mat, plotting.overview_channels);
+    catch ME
+        warning('run_session_unified:sessionOverview', ...
+                'session_overview failed: %s. The data in %s is unaffected.', ME.message, files.mat);
+    end
+end
 
 %% ======================= NESTED FUNCTIONS ===============================
 
@@ -1456,6 +1523,88 @@ end
 function v = entry(state, key)
 % state(key), or [] for a resource that was never created.
 if isKey(state, key), v = state(key); else, v = []; end
+end
+
+function compress_video_h264_check(ffmpegSetting)
+% Resolve ffmpeg the same way compress_video_h264 will after the run; errors with
+% compress_video_h264:ffmpegNotFound if there is none, before any hardware is touched.
+exe = compress_video_h264('which', ffmpegSetting);
+fprintf('ffmpeg     : %s\n', exe);
+end
+
+function [info, outFile] = compressVideo(info, rawFile, mp4File, h)
+% ffmpeg pass for one camera: raw scratch AVI -> H.264 mp4 in the scratch folder,
+% applying the rotation the camera could not. Returns the file the move step should
+% take: the mp4 on success, the raw AVI when compression is off or failed.
+outFile = rawFile;
+info.h264 = struct('enabled', h.enable, 'ok', false);
+if ~h.enable || ~exist(rawFile, 'file'), return; end
+opts = h;
+opts.rotate_deg = info.rotate_deg_pending;
+fprintf('%s: compressing %s -> H.264 (crf %g, %s, rotate %d deg) ...\n', ...
+        info.label, rawFile, h.crf, h.preset, opts.rotate_deg);
+try
+    r = compress_video_h264(rawFile, mp4File, opts);
+catch ME
+    warning('run_session_unified:h264', '%s: compression not run (%s). The raw AVI is kept: %s', ...
+            info.label, ME.message, rawFile);
+    return;
+end
+info.h264 = r;
+info.h264.enabled = true;
+if ~r.ok
+    warning('run_session_unified:h264', '%s: ffmpeg failed (%.1f s). The raw AVI is kept: %s\n%s', ...
+            info.label, r.seconds, rawFile, r.output);
+    if exist(mp4File, 'file'), delete(mp4File); end
+    return;
+end
+if isfinite(r.frames) && r.frames ~= info.frames
+    warning('run_session_unified:h264Frames', '%s: mp4 has %d frames but %d were logged. The raw AVI is kept: %s', ...
+            info.label, r.frames, info.frames, rawFile);
+    outFile = mp4File;                               % still deliver the mp4, but do not delete the raw
+    info.raw_file_kept = rawFile;
+    return;
+end
+fprintf('%s: H.264 done in %.1f s, %.0f MB -> %.0f MB (%d frames)\n', ...
+        info.label, r.seconds, r.bytes_in / 1e6, r.bytes_out / 1e6, r.frames);
+info.rotation_applied   = 'ffmpeg';
+info.rotate_deg_pending = 0;
+outFile = mp4File;
+if h.keep_raw
+    info.raw_file_kept = rawFile;
+else
+    delete(rawFile);
+end
+end
+
+function info = moveVideoToSaveFolder(info, scratchFile, finalFile)
+% Move one finished video from the local scratch folder to its final location and
+% record the outcome in baslerInfo. A no-op when scratch and final are the same path.
+info.scratch_file = scratchFile;
+info.file         = scratchFile;
+info.moved        = false;
+if strcmpi(scratchFile, finalFile)
+    info.file  = finalFile;
+    info.moved = true;
+    return;
+end
+if ~exist(scratchFile, 'file')
+    warning('run_session_unified:videoMove', '%s: nothing to move, %s does not exist.', info.label, scratchFile);
+    return;
+end
+d = dir(scratchFile);
+tMove = tic;
+[ok, msg] = movefile(scratchFile, finalFile, 'f');
+if ok
+    info.file   = finalFile;
+    info.moved  = true;
+    info.move_s = toc(tMove);
+    fprintf('%s: moved to %s (%.0f MB, %.1f s)\n', info.label, finalFile, d.bytes / 1e6, info.move_s);
+else
+    warning('run_session_unified:videoMove', ...
+            '%s: could not move %s to %s: %s. The video is still in the scratch folder.', ...
+            info.label, scratchFile, finalFile, msg);
+end
 end
 
 function S = mergeStruct(S, O, path)

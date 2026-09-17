@@ -7,7 +7,7 @@ function varargout = run_session_gui()
 %   fig = run_session_gui;   % ... and return its uifigure
 %
 % The window is generated from run_session_unified('defaults'), so it always opens on
-% the values currently in the USER SETTINGS block, and a setting added there shows up
+% the values currently in the USER SETTINGS  block, and a setting added there shows up
 % here with no change to this file. One tab per settings section; hover over a field
 % for the comment written next to it in the file. A setting that differs from the
 % file has a bold orange label; an entry that cannot be read as a value turns red.
@@ -18,6 +18,14 @@ function varargout = run_session_gui()
 %          the base workspace, and the changed settings are listed in the command
 %          window when it ends. Errors are shown in the window.
 %   Reset  re-reads the file, dropping your edits.
+%   Save as file defaults
+%          writes every setting that differs from the file into the USER SETTINGS
+%          block of run_session_unified.m itself (values only: comments, alignment
+%          and every other line stay as they are), after a confirmation listing the
+%          changes. From then on those values are the defaults that this window,
+%          Reset and run_session_unified open on. The rewritten file is read back
+%          before the change is accepted; if any value does not come back as written,
+%          the original file is restored.
 %
 % Runs on R2019a and newer. Where grid layouts cannot scroll yet (R2019a, for one),
 % the window is a little wider and long sections continue on extra tabs
@@ -39,6 +47,7 @@ PAGE_ROWS       = 22;             % rows per tab: 22*22 + 21*4 + 20 = 588 px, in
 COMPACT_SPACING = 4;              % px between rows
 % Only where grid rows and columns cannot be sized to 'fit':
 BAR_H   = 26;                     % bottom bar height
+SAVE_W  = 150;                    % Save-as-defaults button width
 RESET_W = 150;                    % Reset button width
 RUN_W   = 60;                     % Run button width
 SECTION_TITLES = struct('meta', 'Meta', 'hw', 'Hardware', 'acq', 'Acquisition', 'visual', 'Visual', ...
@@ -51,7 +60,7 @@ CHOICES = {'visual.mode',               {'closed_loop_stripe', 'closed_loop_osci
            'phantom.save_format',       {'tif12', 'cine'}
            'basler.top.line_inverter',  {'False', 'True'}
            'basler.side.line_inverter', {'False', 'True'}};
-FOLDERS = {'saveFolder', 'phantom.saveRoot'};   % get a Browse button
+FOLDERS = {'saveFolder', 'phantom.saveRoot', 'basler.video_scratch_folder'};   % get a Browse button
 
 % One window per MATLAB: two could start two sessions on the same rig.
 existing = findall(groot, 'Type', 'figure', 'Tag', GUI_TAG);
@@ -76,11 +85,14 @@ if ~canScroll, fig.Position(3:4) = FALLBACK_SIZE; end
 topGrid = uigridlayout(root, [1 3], 'Padding', [0 0 0 0]);
 topGrid.ColumnWidth = {LABEL_W, '1x', BROWSE_W};
 tabs = uitabgroup(root);
-bottom = uigridlayout(root, [1 3], 'Padding', [0 0 0 0]);
-if canFit, bottom.ColumnWidth = {'1x', 'fit', 'fit'}; else, bottom.ColumnWidth = {'1x', RESET_W, RUN_W}; end
+bottom = uigridlayout(root, [1 4], 'Padding', [0 0 0 0]);
+if canFit, bottom.ColumnWidth = {'1x', 'fit', 'fit', 'fit'}; else, bottom.ColumnWidth = {'1x', SAVE_W, RESET_W, RUN_W}; end
 statusLabel = uilabel(bottom, 'Text', '', 'Tag', 'statusLabel');
 if canFit && isprop(statusLabel, 'WordWrap'), statusLabel.WordWrap = 'on'; end   % grows the 'fit' row
 statusFg = statusLabel.FontColor;
+uibutton(bottom, 'Text', 'Save as file defaults', 'Tag', 'saveDefaultsButton', ...
+         'Tooltip', 'Write the changed settings into the USER SETTINGS block of run_session_unified.m', ...
+         'ButtonPushedFcn', @(~, ~) onSaveDefaults());
 uibutton(bottom, 'Text', 'Reset to file defaults', 'Tag', 'resetButton', ...
          'Tooltip', 'Re-read the USER SETTINGS block of run_session_unified.m', ...
          'ButtonPushedFcn', @(~, ~) onReset());
@@ -290,6 +302,45 @@ if nargout > 0, varargout{1} = fig; end
         if ~isempty(hit), tabs.SelectedTab = hit(1); end
     end
 
+    function onSaveDefaults()
+        % Write the settings that differ from the file into the file itself, so they
+        % are the defaults this window, Reset and run_session_unified open on.
+        if running, return; end
+        [~, changed, bad] = collectOverrides();
+        if ~isempty(bad)
+            setStatus(['Nothing saved. Fix the red entries: ' strjoin(bad, ', ')], true);
+            uialert(fig, sprintf('These entries cannot be read as values:\n\n%s', strjoin(bad, newline)), ...
+                    'Invalid settings');
+            return;
+        end
+        if isempty(changed)
+            setStatus('No setting differs from the file; nothing to save.', false);
+            return;
+        end
+        file  = which('run_session_unified');
+        lines = cellfun(@(p, v) sprintf('%s = %s', p, valueText(v)), changed(:, 1), changed(:, 2), ...
+                        'UniformOutput', false);
+        % The tests set skipConfirm on the figure; a person is always asked first.
+        if ~isequal(getappdata(fig, 'skipConfirm'), true)
+            choice = uiconfirm(fig, sprintf('Write these %d setting(s) into the USER SETTINGS block of\n%s ?\n\n%s', ...
+                                            numel(lines), file, strjoin(lines, newline)), ...
+                               'Save as file defaults', 'Options', {'Save', 'Cancel'}, ...
+                               'DefaultOption', 1, 'CancelOption', 2);
+            if ~strcmp(choice, 'Save'), setStatus('Not saved.', false); return; end
+        end
+        try
+            writeSettingsFile(file, changed);
+        catch ME
+            setStatus(['Nothing saved: ' ME.message], true);
+            uialert(fig, ME.message, 'Save failed');
+            return;
+        end
+        fprintf('run_session_gui: wrote %d setting(s) into %s:\n', numel(lines), file);
+        fprintf('  %s\n', lines{:});
+        onReset();   % re-read the file: the marks clear because the values now match it
+        setStatus(sprintf('Saved %d setting(s) as the defaults in %s', numel(lines), file), false);
+    end
+
     function t = sectionTitle(name)
         if isfield(SECTION_TITLES, name), t = SECTION_TITLES.(name); else, t = name; end
     end
@@ -397,15 +448,163 @@ end
 
 function t = valueText(v)
 % A value as it would be typed in MATLAB: 'text', 4, [0 3000], true, {'a', 'b'}.
+% Also what "Save as file defaults" writes, so every branch must be valid source.
 if ischar(v)
     t = ['''' strrep(v, '''', '''''') ''''];
 elseif islogical(v) && isscalar(v)
     if v, t = 'true'; else, t = 'false'; end
 elseif iscellstr(v)
     t = ['{' strjoin(cellfun(@valueText, v, 'UniformOutput', false), ', ') '}'];
+elseif isnumeric(v) && isempty(v)
+    t = '[]';                      % mat2str([]) is 'zeros(0,0)'
 else
     t = mat2str(v);
 end
+end
+
+%% ---- Save as file defaults: rewriting the USER SETTINGS block --------------
+
+function writeSettingsFile(file, changed)
+% Replace the values of the settings in changed ({path, value} rows) inside the
+% USER SETTINGS block of file, leaving every other character alone. All or nothing:
+% the new text is built in full first, then written, then read back through
+% run_session_unified('defaults'). If any value does not come back as written, the
+% original text is put back and an error raised.
+old = fileread(file);
+if contains(old, sprintf('\r\n')), nl = sprintf('\r\n'); else, nl = newline; end
+src = splitlines(old);
+missing = {};
+for k = 1:size(changed, 1)
+    [b0, b1] = settingsBlock(src, file);          % re-found each time: a multi-line statement may collapse
+    [src, ok] = replaceSetting(src, b0, b1, changed{k, 1}, changed{k, 2});
+    if ~ok, missing{end + 1} = changed{k, 1}; end %#ok<AGROW>
+end
+if ~isempty(missing)
+    error('run_session_gui:settingNotFound', ...
+          'No assignment of %s in the USER SETTINGS block of %s. Nothing was written.', ...
+          strjoin(missing, ', '), file);
+end
+writeText(file, strjoin(src, nl));
+clear('run_session_unified');                     % make sure the next call parses the new file
+try
+    S = run_session_unified('defaults');
+    for k = 1:size(changed, 1)
+        parts = strsplit(changed{k, 1}, '.');
+        got   = getfield(S, parts{:});
+        assert(sameValue(got, changed{k, 2}), '%s reads back as %s, not %s', ...
+               changed{k, 1}, valueText(got), valueText(changed{k, 2}));
+    end
+catch ME
+    writeText(file, old);
+    clear('run_session_unified');
+    error('run_session_gui:writeFailed', ...
+          'The rewritten file did not read back correctly (%s). The original file was restored.', ME.message);
+end
+end
+
+function [b0, b1] = settingsBlock(src, file)
+% First and last line index inside the USER SETTINGS block.
+s = find(~cellfun(@isempty, regexp(src, '^\s*%%\s*=+\s*USER SETTINGS', 'once')), 1);
+e = find(~cellfun(@isempty, regexp(src, '^\s*%%\s*=+\s*END USER SETTINGS', 'once')), 1);
+if isempty(s) || isempty(e) || e <= s
+    error('run_session_gui:noSettingsBlock', 'No USER SETTINGS ... END USER SETTINGS block in %s.', file);
+end
+b0 = s + 1; b1 = e - 1;
+end
+
+function [src, ok] = replaceSetting(src, b0, b1, path, v)
+% Give the setting at path the value v in the lines src (a cellstr of the file).
+% Either the setting has its own assignment line (possibly continued with ...), which
+% is collapsed to one line that keeps its end-of-line comment and alignment; or it is
+% a field of a struct(...) call, e.g. basler.top.gain inside
+% "basler.top = struct(..., 'gain', 5, ...)", where only the value token changes.
+ok = false;
+k = findAssignment(src, b0, b1, path);
+if ~isempty(k)
+    kEnd = statementEnd(src, k);
+    ln   = src{k};
+    eq   = find(ln == '=', 1);                     % the path itself never contains one
+    [~, comment, col] = splitComment(ln);
+    code = [ln(1:eq) ' ' valueText(v) ';'];
+    if isempty(comment)
+        src{k} = code;
+    else
+        src{k} = [code, repmat(' ', 1, max(2, col - 1 - numel(code))), '% ', comment];
+    end
+    src(k + 1:kEnd) = [];
+    ok = true;
+    return;
+end
+dot = find(path == '.', 1, 'last');
+if isempty(dot), return; end
+parent = path(1:dot - 1);
+leaf   = path(dot + 1:end);
+k = findAssignment(src, b0, b1, parent);
+if isempty(k), return; end
+kEnd = statementEnd(src, k);
+stmt = strjoin(src(k:kEnd), newline);              % kept multi-line: only the value token changes
+% 'leaf', <value>  -- the value may sit on the next line after a ... continuation
+key = ['''' regexptranslate('escape', leaf) '''\s*,\s*(?:\.\.\.[^\n]*\n\s*)?'];
+i = regexp(stmt, key, 'end', 'once') + 1;
+if isempty(i) || i > numel(stmt), return; end
+e = valueTokenEnd(stmt, i);
+stmt = [stmt(1:i - 1) valueText(v) stmt(e + 1:end)];
+src(k:kEnd) = splitlines(stmt);                    % same number of lines as before
+ok = true;
+end
+
+function k = findAssignment(src, b0, b1, path)
+% Line index (into src) of "path = ..." inside the block, [] when there is none.
+pat = ['^\s*' regexptranslate('escape', path) '\s*=(?!=)'];
+hit = find(~cellfun(@isempty, regexp(src(b0:b1), pat, 'once')), 1);
+if isempty(hit), k = []; else, k = b0 + hit - 1; end
+end
+
+function kEnd = statementEnd(src, k)
+% Last line of the statement starting on line k: lines whose code ends in ... continue.
+kEnd = k;
+while kEnd < numel(src)
+    code = splitComment(src{kEnd});
+    if isempty(regexp(strtrim(code), '\.\.\.$', 'once')), break; end
+    kEnd = kEnd + 1;
+end
+end
+
+function e = valueTokenEnd(s, i)
+% Index of the last character of the value that starts at s(i): a quoted string, a
+% bracketed [...] / {...} / (...) expression, or a bare token up to the next , or ).
+if s(i) == ''''
+    j = i + 1;
+    while j <= numel(s)
+        if s(j) == ''''
+            if j < numel(s) && s(j + 1) == '''', j = j + 2; continue; end   % doubled quote
+            e = j; return;
+        end
+        j = j + 1;
+    end
+    error('run_session_gui:unterminatedString', 'Unterminated string in the settings statement.');
+end
+depth = 0;
+e = numel(s);
+for j = i:numel(s)
+    switch s(j)
+        case {'[', '{', '('}
+            depth = depth + 1;
+        case {']', '}', ')'}
+            if depth == 0, e = j - 1; break; end
+            depth = depth - 1;
+        case ','
+            if depth == 0, e = j - 1; break; end
+    end
+end
+while e > i && isspace(s(e)), e = e - 1; end        % drop the whitespace before the , or )
+end
+
+function writeText(file, txt)
+fid = fopen(file, 'w');                             % binary: line endings written as given
+assert(fid > 0, 'run_session_gui:cannotWrite', 'Cannot open %s for writing.', file);
+c = onCleanup(@() fclose(fid));
+fprintf(fid, '%s', txt);
 end
 
 function items = flatten(s, prefix)
@@ -464,7 +663,13 @@ end
 function c = commentOf(ln)
 % Text after the first % outside a quoted string ('' when the line has none), so a
 % value such as '50% power' is not mistaken for the start of the comment.
-c = '';
+[~, c] = splitComment(ln);
+end
+
+function [code, comment, col] = splitComment(ln)
+% The code part of a line, the trimmed comment after its first % outside a quoted
+% string ('' when there is none), and the column of that % (0 when there is none).
+code = ln; comment = ''; col = 0;
 nameEnd = ['A':'Z' 'a':'z' '0':'9' '_.)]}'''];   % a ' straight after one of these is a transpose
 q = '';   % quote character of the string being scanned, '' when outside one
 j = 1;
@@ -476,7 +681,9 @@ while j <= numel(ln)
             else, q = ''; end
         end
     elseif ch == '%'
-        c = strtrim(ln(j + 1:end));
+        code    = ln(1:j - 1);
+        comment = strtrim(ln(j + 1:end));
+        col     = j;
         return;
     elseif ch == '"' || (ch == '''' && (j == 1 || ~any(ln(j - 1) == nameEnd)))
         q = ch;
