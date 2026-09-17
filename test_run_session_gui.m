@@ -322,7 +322,125 @@ b = ctrl(fig, 'runButton');
 verifyEqual(testCase, char(b.Enable), 'on', 'Run must be available again after a failed session.');
 end
 
+%% ---- Save as file defaults ---------------------------------------------
+% These tests rewrite a private copy of run_session_unified.m placed ahead of the
+% real one on the path, so the real file is never touched.
+
+function testSaveDefaultsWritesTheValuesIntoTheFile(testCase)
+% Every kind of control, plus a setting inside a struct(...) call (basler.side.gain):
+% the file re-read gives the new values, the window shows them unmarked, and Reset
+% now returns to them.
+file = tempSettingsFile(testCase);
+S = run_session_unified('defaults');
+fig = run_session_gui();
+setappdata(fig, 'skipConfirm', true);
+want = {'meta.flyNumber',     [S.meta.flyNumber '7']
+        'hw.simulate',        ~S.hw.simulate
+        'opto.mode',          otherItem(ctrl(fig, 'opto.mode'))
+        'acq.TrialLength',    S.acq.TrialLength + 1
+        'opto.stimDurations', [0 500 750]
+        'basler.side.gain',   S.basler.side.gain + 1
+        'saveFolder',         [S.saveFolder 'newdefault\']};
+for k = 1:size(want, 1)
+    v = want{k, 2};
+    if isnumeric(v), v = mat2str(v); end
+    setField(fig, want{k, 1}, v);
+end
+click(fig, 'saveDefaultsButton');
+verifySubstring(testCase, statusText(fig), 'Saved', 'The status must report the save.');
+S2 = run_session_unified('defaults');
+for k = 1:size(want, 1)
+    verifyEqual(testCase, defaultAt(S2, want{k, 1}), want{k, 2}, [want{k, 1} ' must be the new file default.']);
+    verifyFalse(testCase, isMarkedChanged(fig, want{k, 1}), [want{k, 1} ' must no longer be marked as changed.']);
+end
+click(fig, 'resetButton');
+verifyEqual(testCase, val(fig, 'meta.flyNumber'), want{1, 2}, 'Reset must return to the new defaults.');
+verifySubstring(testCase, fileread(file), ['acq.TrialLength     = ' mat2str(want{4, 2}) ';'], ...
+    'The value must be written in place, keeping the alignment of the = sign.');
+verifyEqual(testCase, fileread(testCase.TestData.realFile), testCase.TestData.realText, ...
+    'The real run_session_unified.m must not be touched.');
+end
+
+function testSaveDefaultsKeepsTheRestOfTheFile(testCase)
+% Only the value changes: the comment next to the setting, its alignment and every
+% other line survive, and a struct(...) statement keeps its shape.
+file = tempSettingsFile(testCase);
+before = splitlines(fileread(file));
+S = run_session_unified('defaults');
+fig = run_session_gui();
+setappdata(fig, 'skipConfirm', true);
+setField(fig, 'acq.TrialLength', num2str(S.acq.TrialLength + 1));
+setField(fig, 'basler.side.gain', num2str(S.basler.side.gain + 1));
+click(fig, 'saveDefaultsButton');
+after = splitlines(fileread(file));
+assertEqual(testCase, numel(after), numel(before), 'The number of lines must not change.');
+diffLines = find(~strcmp(before, after));
+verifyNumElements(testCase, diffLines, 2, 'Exactly the two assignments may differ.');
+for i = diffLines'
+    verifyEqual(testCase, regexp(after{i}, '%.*$', 'match', 'once'), regexp(before{i}, '%.*$', 'match', 'once'), ...
+        sprintf('Line %d must keep its comment.', i));
+    verifyEqual(testCase, find(after{i} == '=', 1), find(before{i} == '=', 1), ...
+        sprintf('Line %d must keep the column of its = sign.', i));
+end
+verifyTrue(testCase, any(contains(after(diffLines), 'acq.TrialLength')), 'The acq.TrialLength line must be the one rewritten.');
+verifyTrue(testCase, any(contains(after(diffLines), ['''gain'', ' num2str(S.basler.side.gain + 1)])), ...
+    'The gain value inside the basler.side struct(...) call must be the one rewritten.');
+end
+
+function testSaveDefaultsRefusesInvalidEntries(testCase)
+file = tempSettingsFile(testCase);
+before = fileread(file);
+fig = run_session_gui();
+setappdata(fig, 'skipConfirm', true);
+setField(fig, 'meta.flyNumber', '9');
+setField(fig, 'opto.stimDurations', 'abc');
+click(fig, 'saveDefaultsButton');
+verifyEqual(testCase, fileread(file), before, 'Nothing may be written while an entry is invalid.');
+verifySubstring(testCase, statusText(fig), 'opto.stimDurations', 'The status must name the bad setting.');
+verifyTrue(testCase, isMarkedChanged(fig, 'meta.flyNumber'), 'The pending edit must stay in the window.');
+end
+
+function testSaveDefaultsWithNothingChangedLeavesTheFileAlone(testCase)
+file = tempSettingsFile(testCase);
+before = fileread(file);
+fig = run_session_gui();
+setappdata(fig, 'skipConfirm', true);
+click(fig, 'saveDefaultsButton');
+verifyEqual(testCase, fileread(file), before);
+verifySubstring(testCase, statusText(fig), 'nothing to save');
+end
+
 %% ---- helpers -------------------------------------------------------------
+
+function file = tempSettingsFile(testCase)
+% A private copy of run_session_unified.m that shadows the real one, so that saving
+% defaults rewrites the copy. MATLAB resolves the current folder before the path, so
+% the copy is made the current folder (the real code folder stays reachable on the
+% path). The real file's path and text are kept in TestData so a test can check it
+% was left alone.
+realFile = which('run_session_unified');
+realDir  = fileparts(realFile);
+testCase.TestData.realFile = realFile;
+testCase.TestData.realText = fileread(realFile);
+onPath = contains([pathsep path pathsep], [pathsep realDir pathsep]);
+if ~onPath, addpath(realDir); end
+d = tempname;
+mkdir(d);
+file = fullfile(d, 'run_session_unified.m');
+copyfile(realFile, file);
+fileattrib(file, '+w');
+oldDir = cd(d);
+clear('run_session_unified');
+testCase.addTeardown(@() removeTempSettingsFile(d, oldDir, realDir, ~onPath));
+assert(strcmp(which('run_session_unified'), file), 'The temporary copy does not shadow the real file.');
+end
+
+function removeTempSettingsFile(d, oldDir, realDir, dropPath)
+cd(oldDir);
+if dropPath, rmpath(realDir); end
+clear('run_session_unified');
+rmdir(d, 's');
+end
 
 function fig = simulatedGui(testCase, trialLength)
 % The window set up for a fast, hardware-free session into a scratch folder:
